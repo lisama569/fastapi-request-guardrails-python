@@ -55,11 +55,13 @@ def create_app(order_service: OrderService) -> FastAPI:
         return {"service": "request-guardrails", "status": "ok"}
 
     @app.post("/orders", status_code=201)
-    async def create_order(
+    def create_order(
         payload: CreateOrderRequest,
         x_caller_id: str = Header(default="anonymous", alias="X-Caller-Id"),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> JSONResponse:
+        # 同步端点：FastAPI 会把请求放到线程池执行，慢下游只阻塞当前请求线程，
+        # 事件循环与其他调用方的请求不会被一并拖住排队
         logger.info(
             "http request POST /orders caller=%s key=%s payload=%s",
             x_caller_id, idempotency_key, payload.model_dump(),
@@ -78,7 +80,12 @@ def create_app(order_service: OrderService) -> FastAPI:
         return {
             "circuit_state": order_service.breaker.state().value,
             "downstream_mode": order_service.downstream.mode,
+            # 当前调用方配额：命中档位、已用、本窗口剩余、窗口重置剩余时间
+            "caller_quota": order_service.rate_limiter.quota_status(x_caller_id),
+            # 兼容旧字段：历史调用方仍可直接读 caller_used_quota
             "caller_used_quota": order_service.rate_limiter.usage(x_caller_id),
+            # 服务整体容量保护：全局在途 / 上限 / 空闲 / 单调用方份额
+            "global_capacity": order_service.capacity.capacity_status(),
         }
 
     @app.post("/test/downstream-mode/{mode}")

@@ -13,6 +13,7 @@ from app.api import create_app
 from app.circuit_breaker import CircuitBreaker
 from app.config import Settings
 from app.downstream import DownstreamClient
+from app.global_capacity import GlobalCapacityLimiter
 from app.idempotency import IdempotencyStore
 from app.rate_limiter import RateLimiter
 from app.service import OrderService
@@ -23,11 +24,14 @@ def settings(tmp_path):
     return Settings(
         rate_limit=5,
         rate_limit_window_seconds=10.0,
+        rate_limits={"vip": 20, "tight": 2},
         rate_limit_state_file=str(tmp_path / "ratelimit.json"),
         idempotency_ttl_seconds=3600.0,
         circuit_failure_threshold=3,
         circuit_open_seconds=5.0,
         circuit_half_open_success_threshold=2,
+        global_max_inflight=8,
+        global_capacity_caller_share=0.5,
         downstream_timeout_seconds=0.3,
     )
 
@@ -55,6 +59,7 @@ def components(settings, fake_clock):
         "limiter": RateLimiter(settings),
         "idempotency": IdempotencyStore(settings),
         "breaker": breaker,
+        "capacity": GlobalCapacityLimiter(settings),
         "downstream": downstream,
         "clock": fake_clock,
     }
@@ -62,11 +67,12 @@ def components(settings, fake_clock):
 
 @pytest.fixture()
 def service(settings, components):
-    executor = ThreadPoolExecutor(max_workers=16)
+    executor = ThreadPoolExecutor(max_workers=32)
     svc = OrderService(
         rate_limiter=components["limiter"],
         idempotency=components["idempotency"],
         breaker=components["breaker"],
+        capacity=components["capacity"],
         downstream=components["downstream"],
         settings=settings,
         executor=executor,

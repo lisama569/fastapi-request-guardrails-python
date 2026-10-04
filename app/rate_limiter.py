@@ -1,7 +1,10 @@
-"""按调用方维度的固定窗口配额限制（并发安全，可持久化到文件）。
+"""按调用方维度的固定窗口配额限制（并发安全，可持久化到文件，支持分级配额）。
 
 语义：
 - 对每个 caller 维护一个固定时间窗口内的已占用计数；
+- 每个调用方的额度由 limit_for(caller) 决定：settings.rate_limits 中单独配置的
+  调用方走专属档（tier="custom:<limit>"），未配置的走默认档 rate_limit
+  （tier="default"），与历史行为完全一致；
 - check() 在锁内完成"判窗口 -> 读计数 -> 比较 -> 自增 -> 落盘"，
   因此同一窗口内并发请求不会超发，也不会漏判；
 - 计数持久化到 JSON 文件：服务重启后若仍处于同一窗口，已消耗额度继续生效，
@@ -55,13 +58,29 @@ class RateLimiter:
             json.dump(self._buckets, fh)
         os.replace(tmp, path)
 
+    # ------------------------------------------------------------------ quota
+    def limit_for(self, caller: str) -> int:
+        """返回 caller 适用的窗口额度（专属档优先，否则默认档）。"""
+        return self._settings.rate_limits.get(caller, self._settings.rate_limit)
+
+    def tier_for(self, caller: str) -> str:
+        """返回 caller 命中的配额档位标识（供状态接口 / 日志打印 tier=）。"""
+        if caller in self._settings.rate_limits:
+            return f"custom:{self._settings.rate_limits[caller]}"
+        return "default"
+
+    def _window_start(self, now: float) -> float:
+        window = self._settings.rate_limit_window_seconds
+        return (now // window) * window
+
     # ------------------------------------------------------------------ api
     def check(self, caller: str) -> None:
         """占用一个配额；超额抛出 RateLimitExceeded 并带 Retry-After 提示。"""
         window = self._settings.rate_limit_window_seconds
-        limit = self._settings.rate_limit
+        limit = self.limit_for(caller)
+        tier = self.tier_for(caller)
         now = time.time()
-        window_start = (now // window) * window
+        window_start = self._window_start(now)
 
         with self._lock:
             bucket = self._buckets.get(caller)
@@ -72,8 +91,8 @@ class RateLimiter:
             if used >= limit:
                 retry_after = max(0.0, window_start + window - now)
                 logger.info(
-                    "rate-limit decision caller=%s window_start=%.1f used=%d limit=%d -> REJECT retry_after=%.2f",
-                    caller, window_start, used, limit, retry_after,
+                    "rate-limit decision caller=%s tier=%s window_start=%.1f used=%d limit=%d -> REJECT retry_after=%.2f",
+                    caller, tier, window_start, used, limit, retry_after,
                 )
                 raise RateLimitExceeded(
                     f"caller '{caller}' exceeded quota of {limit} requests per {window:g}s window",
@@ -82,20 +101,42 @@ class RateLimiter:
             bucket[1] = used + 1
             self._persist_locked()
             logger.info(
-                "rate-limit decision caller=%s window_start=%.1f used=%d limit=%d -> ALLOW",
-                caller, window_start, used + 1, limit,
+                "rate-limit decision caller=%s tier=%s window_start=%.1f used=%d limit=%d -> ALLOW",
+                caller, tier, window_start, used + 1, limit,
             )
 
     def usage(self, caller: str) -> int:
         """返回 caller 当前窗口已用配额（供状态查看）。"""
-        window = self._settings.rate_limit_window_seconds
         now = time.time()
-        window_start = (now // window) * window
+        window_start = self._window_start(now)
         with self._lock:
             bucket = self._buckets.get(caller)
             if bucket is None or float(bucket[0]) != window_start:
                 return 0
             return int(bucket[1])
+
+    def quota_status(self, caller: str) -> dict:
+        """状态查看：已用 / 总额度 / 剩余 / 档位 / 窗口信息（不占用配额）。"""
+        now = time.time()
+        window = self._settings.rate_limit_window_seconds
+        window_start = self._window_start(now)
+        limit = self.limit_for(caller)
+        with self._lock:
+            bucket = self._buckets.get(caller)
+            used = (
+                int(bucket[1])
+                if bucket is not None and float(bucket[0]) == window_start
+                else 0
+            )
+        return {
+            "caller": caller,
+            "tier": self.tier_for(caller),
+            "used": used,
+            "limit": limit,
+            "remaining": max(0, limit - used),
+            "window_seconds": window,
+            "window_reset_seconds": max(0.0, window_start + window - now),
+        }
 
     def reset(self, caller: str | None = None) -> None:
         """清空计数（测试 / 管理接口使用）。"""

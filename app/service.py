@@ -1,7 +1,17 @@
-"""业务编排：限流 -> 幂等 -> 熔断 -> 下游调用。
+"""业务编排：调用方配额 -> 幂等判定 -> 熔断 -> 全局容量 -> 带超时下游调用。
 
-成功返回 (status_code, body)；所有可预期失败抛出 GuardrailError 子类，
-内部异常不向上游透出堆栈。
+并发模型要点（单进程）：
+- FastAPI 端点以同步函数注册，请求在线程池中执行，慢请求只阻塞自己的
+  工作线程，不会把事件循环或其他调用方串成一队；
+- 全局容量槽位只在"真正准备调用下游"时占用，并在下游调用落定
+  （成功 / 失败 / 超时 / 拒绝）的同一代码块内释放，因此超时候的在途计数
+  立即回收，不会让线程池里仍在睡眠的慢任务虚占下游额度；
+- 幂等追随者（在途并发同标识）只等待 leader 的结果，自身不占容量槽位、
+  不调用下游，真实下单永远只发生一次。
+
+成功返回 (status_code, body)；可预期失败抛 GuardrailError 子类；
+未知异常在本层归一化为 InternalServerError（仍会被兜底处理器转换为
+无差别的 internal_error 响应）。
 """
 
 from __future__ import annotations
@@ -9,13 +19,28 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from .circuit_breaker import CircuitBreaker
 from .config import Settings, get_settings
 from .downstream import DownstreamClient
-from .errors import CircuitBreakerOpen, DownstreamError, DownstreamTimeout
-from .idempotency import IdempotencyStore, KeyState
+from .errors import (
+    CircuitBreakerOpen,
+    DownstreamError,
+    DownstreamTimeout,
+    GuardrailError,
+    IdempotencyInProgress,
+    InternalServerError,
+)
+from .global_capacity import CapacityToken, GlobalCapacityLimiter
+from .idempotency import (
+    BeginOutcome,
+    IdempotencyStore,
+    KeyState,
+    Role,
+    snapshot_error,
+)
 from .rate_limiter import RateLimiter
 
 logger = logging.getLogger("guardrails.service")
@@ -32,6 +57,7 @@ class OrderService:
         rate_limiter: RateLimiter | None = None,
         idempotency: IdempotencyStore | None = None,
         breaker: CircuitBreaker | None = None,
+        capacity: GlobalCapacityLimiter | None = None,
         downstream: DownstreamClient | None = None,
         settings: Settings | None = None,
         executor: ThreadPoolExecutor | None = None,
@@ -40,11 +66,15 @@ class OrderService:
         self.rate_limiter = rate_limiter or RateLimiter(self._settings)
         self.idempotency = idempotency or IdempotencyStore(self._settings)
         self.breaker = breaker or CircuitBreaker(self._settings)
+        self.capacity = capacity or GlobalCapacityLimiter(self._settings)
         self.downstream = downstream or DownstreamClient(
             timeout=self._settings.downstream_timeout_seconds
         )
-        self._executor = executor or ThreadPoolExecutor(max_workers=16)
+        # 工作线程数需明显大于全局在途上限，保证拿到容量槽位的请求
+        # 立刻有线程执行，慢请求在各自线程并行推进而非排队串行
+        self._executor = executor or ThreadPoolExecutor(max_workers=32)
         self._side_effects = 0
+        self._side_effects_lock = threading.Lock()
 
     @property
     def side_effect_count(self) -> int:
@@ -58,84 +88,110 @@ class OrderService:
             caller, item, quantity, idem_key,
         )
 
-        # 1) 调用方配额
+        # 1) 调用方配额（默认档 / 专属档）
         self.rate_limiter.check(caller)
 
-        # 2) 幂等判定
-        state: KeyState | None = None
+        # 2) 幂等判定：决定本请求是执行者（leader）还是结果复用者（follower）
+        outcome: BeginOutcome | None = None
         if idem_key is not None:
             fp = fingerprint_payload(item, quantity)
-            state = self.idempotency.begin(idem_key, fp)
-            if state.done.is_set() and state.status is not None:
-                logger.info("replay stored result for idem_key=%s status=%d", idem_key, state.status)
-                return state.status, dict(state.body)  # type: ignore[arg-type]
-            # state.done 未置位可能是：本请求是首次（自己登记），或首次仍在执行
-            if state.request_fingerprint != fp:
-                # begin() 已处理冲突，理论上到不了这里
-                raise RuntimeError("unreachable")
-            if state.status is not None:
-                return state.status, dict(state.body)  # type: ignore[arg-type]
-            # 等待场景结束后被 fail() 唤醒：done=True 且 status=None -> 放行重试
-        # 注意：begin 对"处理中重复请求"会等待；若等到结果则上面直接返回，
-        # 若首次请求失败释放了占位，则本次作为新的首次请求继续执行（用同一 state 不安全，
-        # 因此等待超时/失败释放时我们重新 begin 一次）。
-        if idem_key is not None and state is not None and state.done.is_set() and state.status is None:
-            fp = fingerprint_payload(item, quantity)
-            state = self.idempotency.begin(idem_key, fp)
+            outcome = self.idempotency.begin(idem_key, fp)
+            if outcome.role is Role.FOLLOWER:
+                state = outcome.state
+                if state.error is not None:
+                    # 在途追随者：拿到与 leader 完全一致的失败结果
+                    logger.info(
+                        "replay leader failure for idem_key=%s reason=%s",
+                        idem_key, state.error.reason,
+                    )
+                    raise state.error.to_error()
+                if state.status is not None:
+                    logger.info(
+                        "replay stored result for idem_key=%s status=%d",
+                        idem_key, state.status,
+                    )
+                    return state.status, dict(state.body)
+                # begin 等待超时（极端情况）：无可复用结果，不允许自己执行，
+                # 明确告诉调用方稍后用同一标识重试拿结果，绝不产生第二次下单
+                raise IdempotencyInProgress(
+                    f"request with Idempotency-Key '{idem_key}' is still being processed; "
+                    "retry later to obtain its result",
+                )
 
+        state: KeyState | None = outcome.state if outcome is not None else None
+
+        # 3) leader 真正执行业务；任何失败都写入幂等失败快照，让在途追随者复用
         try:
-            status, body = self._invoke_downstream(item, quantity)
-        except Exception:
-            if idem_key is not None and state is not None and state.status is None:
-                self.idempotency.fail(state)
+            status, body = self._invoke_downstream(caller, item, quantity)
+        except GuardrailError as exc:
+            if state is not None:
+                self.idempotency.fail(state, snapshot_error(exc))
             raise
+        except Exception:
+            logger.exception("unexpected error while invoking downstream")
+            internal = InternalServerError("internal server error")
+            if state is not None:
+                self.idempotency.fail(state, snapshot_error(internal))
+            raise internal from None
 
-        if idem_key is not None and state is not None:
+        if state is not None:
             self.idempotency.complete(state, status, body)
         return status, body
 
     # ------------------------------------------------------------------ internals
-    def _invoke_downstream(self, item: str, quantity: int) -> tuple[int, dict]:
-        # 3) 熔断判定
+    def _invoke_downstream(self, caller: str, item: str, quantity: int) -> tuple[int, dict]:
+        # 3a) 熔断判定
         if not self.breaker.allow_request():
             raise CircuitBreakerOpen(
                 "downstream dependency circuit is open; retry later",
                 retry_after=self._settings.circuit_open_seconds,
             )
 
-        # 4) 带超时的下游调用：超时 / 依赖错误 / 成功分别可区分
-        future = self._executor.submit(self.downstream.call, f"{item}:{quantity}")
+        # 3b) 全局容量槽位：仅在熔断放行后、提交下游调用前占用
+        token: CapacityToken | None = None
         try:
-            ref = future.result(timeout=self._settings.downstream_timeout_seconds)
-        except FutureTimeout:
-            self.breaker.record_failure()
-            logger.info(
-                "downstream invocation TIMEOUT after %.2fs",
-                self._settings.downstream_timeout_seconds,
-            )
-            raise DownstreamTimeout(
-                "downstream dependency timed out",
-                retry_after=self._settings.circuit_open_seconds,
-            )
-        except TimeoutError as exc:
-            # 下游自身判定的超时（与调用方 deadline 语义同属超时类，统一为 504）
-            self.breaker.record_failure()
-            logger.info("downstream reported its own timeout: %s", exc)
-            raise DownstreamTimeout("downstream dependency timed out") from None
-        except RuntimeError:
-            self.breaker.record_failure()
-            logger.info("downstream returned business error")
-            raise DownstreamError("downstream dependency returned an error") from None
+            token = self.capacity.acquire(caller)
 
-        self.breaker.record_success()
-        # 5) 唯一副作用点：受幂等键保护，重复提交不会重复执行到这里
-        self._side_effects += 1
-        order_id = f"order-{self._side_effects:06d}"
-        body = {
-            "order_id": order_id,
-            "item": item,
-            "quantity": quantity,
-            "downstream_ref": ref,
-        }
-        logger.info("side effect applied order_id=%s downstream_ref=%s", order_id, ref)
-        return 201, body
+            future = self._executor.submit(self.downstream.call, f"{item}:{quantity}")
+            try:
+                ref = future.result(timeout=self._settings.downstream_timeout_seconds)
+            except FutureTimeout:
+                # 槽位立即释放；线程池中的慢任务继续跑完，但不再虚占下游在途额度
+                future.cancel()
+                self.breaker.record_failure()
+                logger.info(
+                    "downstream invocation TIMEOUT after %.2fs",
+                    self._settings.downstream_timeout_seconds,
+                )
+                raise DownstreamTimeout(
+                    "downstream dependency timed out",
+                    retry_after=self._settings.circuit_open_seconds,
+                )
+            except TimeoutError:
+                # 下游自身判定的超时（语义同属超时类，统一为 504）
+                self.breaker.record_failure()
+                logger.info("downstream reported its own timeout")
+                raise DownstreamTimeout("downstream dependency timed out") from None
+            except RuntimeError:
+                self.breaker.record_failure()
+                logger.info("downstream returned business error")
+                raise DownstreamError("downstream dependency returned an error") from None
+
+            self.breaker.record_success()
+            # 唯一副作用点：只有走到这里的 leader 会下单；
+            # 追随者重放不经过本方法，重复提交永远不会重复下单
+            with self._side_effects_lock:
+                self._side_effects += 1
+                order_id = f"order-{self._side_effects:06d}"
+            body = {
+                "order_id": order_id,
+                "item": item,
+                "quantity": quantity,
+                "downstream_ref": ref,
+            }
+            logger.info("side effect applied order_id=%s downstream_ref=%s", order_id, ref)
+            return 201, body
+        finally:
+            # 成功 / 失败 / 超时 / 容量拒绝之外的所有落定路径都在这里回收槽位
+            if token is not None:
+                self.capacity.release(token)
