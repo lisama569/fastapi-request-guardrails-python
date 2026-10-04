@@ -56,10 +56,17 @@ class RateLimiter:
         os.replace(tmp, path)
 
     # ------------------------------------------------------------------ api
+    def limit_for(self, caller: str) -> tuple[int, str]:
+        """返回 caller 命中的额度与档位（override / default）。"""
+        overrides = self._settings.rate_limit_overrides
+        if caller in overrides:
+            return overrides[caller], "override"
+        return self._settings.rate_limit, "default"
+
     def check(self, caller: str) -> None:
         """占用一个配额；超额抛出 RateLimitExceeded 并带 Retry-After 提示。"""
         window = self._settings.rate_limit_window_seconds
-        limit = self._settings.rate_limit
+        limit, tier = self.limit_for(caller)
         now = time.time()
         window_start = (now // window) * window
 
@@ -72,8 +79,8 @@ class RateLimiter:
             if used >= limit:
                 retry_after = max(0.0, window_start + window - now)
                 logger.info(
-                    "rate-limit decision caller=%s window_start=%.1f used=%d limit=%d -> REJECT retry_after=%.2f",
-                    caller, window_start, used, limit, retry_after,
+                    "rate-limit decision caller=%s tier=%s window_start=%.1f used=%d limit=%d -> REJECT retry_after=%.2f",
+                    caller, tier, window_start, used, limit, retry_after,
                 )
                 raise RateLimitExceeded(
                     f"caller '{caller}' exceeded quota of {limit} requests per {window:g}s window",
@@ -82,8 +89,8 @@ class RateLimiter:
             bucket[1] = used + 1
             self._persist_locked()
             logger.info(
-                "rate-limit decision caller=%s window_start=%.1f used=%d limit=%d -> ALLOW",
-                caller, window_start, used + 1, limit,
+                "rate-limit decision caller=%s tier=%s window_start=%.1f used=%d limit=%d -> ALLOW",
+                caller, tier, window_start, used + 1, limit,
             )
 
     def usage(self, caller: str) -> int:
@@ -96,6 +103,17 @@ class RateLimiter:
             if bucket is None or float(bucket[0]) != window_start:
                 return 0
             return int(bucket[1])
+
+    def quota_info(self, caller: str) -> dict:
+        """返回 caller 的配额视图：命中档位、额度、已用、窗口内剩余。"""
+        limit, tier = self.limit_for(caller)
+        used = self.usage(caller)
+        return {
+            "tier": tier,
+            "limit": limit,
+            "used": used,
+            "remaining": max(0, limit - used),
+        }
 
     def reset(self, caller: str | None = None) -> None:
         """清空计数（测试 / 管理接口使用）。"""

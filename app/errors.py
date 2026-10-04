@@ -30,6 +30,11 @@ class IdempotencyInProgress(GuardrailError):
     status_code = 409
 
 
+class GlobalCapacityExceeded(GuardrailError):
+    reason = "global_capacity_exceeded"
+    status_code = 503
+
+
 class CircuitBreakerOpen(GuardrailError):
     reason = "circuit_breaker_open"
     status_code = 503

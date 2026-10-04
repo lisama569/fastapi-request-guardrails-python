@@ -55,11 +55,13 @@ def create_app(order_service: OrderService) -> FastAPI:
         return {"service": "request-guardrails", "status": "ok"}
 
     @app.post("/orders", status_code=201)
-    async def create_order(
+    def create_order(
         payload: CreateOrderRequest,
         x_caller_id: str = Header(default="anonymous", alias="X-Caller-Id"),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> JSONResponse:
+        # 同步路由：Starlette 将其放入线程池执行，慢下游不会阻塞事件循环，
+        # 并发请求在下游调用层面真正并行（整体耗时 ≈ 单个请求耗时）
         logger.info(
             "http request POST /orders caller=%s key=%s payload=%s",
             x_caller_id, idempotency_key, payload.model_dump(),
@@ -75,10 +77,18 @@ def create_app(order_service: OrderService) -> FastAPI:
 
     @app.get("/health/downstream")
     async def downstream_health(x_caller_id: str = Header(default="anonymous", alias="X-Caller-Id")) -> dict:
+        quota = order_service.rate_limiter.quota_info(x_caller_id)
         return {
             "circuit_state": order_service.breaker.state().value,
             "downstream_mode": order_service.downstream.mode,
-            "caller_used_quota": order_service.rate_limiter.usage(x_caller_id),
+            # 兼容字段：当前调用方窗口已用配额
+            "caller_used_quota": quota["used"],
+            # 新增：命中档位（default/override）、该档额度、窗口内剩余
+            "caller_quota_tier": quota["tier"],
+            "caller_quota_limit": quota["limit"],
+            "caller_quota_remaining": quota["remaining"],
+            # 新增：服务整体容量保护视图
+            "global_capacity": order_service.capacity.stats(),
         }
 
     @app.post("/test/downstream-mode/{mode}")
