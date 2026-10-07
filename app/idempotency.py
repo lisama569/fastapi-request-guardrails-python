@@ -3,8 +3,10 @@
 规则：
 - 首次携带 key 的请求：登记 fingerprint 后执行，结果（状态码 + 响应体）只写一次；
 - 同 key 同 fingerprint 的重复提交：
-  * 首次仍在处理 -> 等待其完成：成功则返回同一结果；失败则收到与首个请求
-    完全相同的失败（reason / message / retry_after 一致），对外结果确定、可解释；
+  * 首次仍在处理 -> 等待其完成：成功则返回同一结果；失败（无论已认识的
+    GuardrailError 还是非预期异常统一成的 InternalError）则收到与首个请求
+    完全相同的失败（reason / message / retry_after 一致），对外结果确定、
+    可解释，内部异常的类型、消息与堆栈绝不透出；
   * 首次已完成   -> 直接返回已存结果（状态码与响应体完全一致）；
 - 同 key 不同 fingerprint -> 明确拒绝 IdempotencyConflict，不覆盖既有结果；
 - 首次请求失败：占位被移除（失败结果不缓存），之后携带同 key 的新请求可作为

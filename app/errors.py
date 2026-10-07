@@ -48,3 +48,20 @@ class DownstreamTimeout(GuardrailError):
 class DownstreamError(GuardrailError):
     reason = "downstream_error"
     status_code = 502
+
+
+class InternalError(GuardrailError):
+    """非预期内部异常的统一对外形态。
+
+    reason / 状态码 / message 全部固定，绝不携带原始异常的类型、消息或堆栈；
+    原始细节只允许出现在服务端日志里。同一份实例会分发给并发同标识的重复请求，
+    保证所有并发提交拿到完全一致的结果。
+    """
+
+    reason = "internal_error"
+    status_code = 500
+    _GENERIC_MESSAGE = "internal server error"
+
+    def __init__(self, message: str | None = None, *, retry_after: float | None = None) -> None:
+        # 忽略调用方传入的任何具体描述，对外永远是无差别的固定文案
+        super().__init__(self._GENERIC_MESSAGE, retry_after=retry_after)

@@ -8,7 +8,7 @@
 ```bash
 uv sync
 uv run uvicorn main:app --reload
-uv run pytest          # 32 个用例：分级配额 / 并发配额 / 重复与冲突提交 / 全局容量 / 并发隔离 / 熔断与半开恢复
+uv run pytest          # 34 个用例：分级配额 / 并发配额 / 重复与冲突提交 / 全局容量 / 并发隔离 / 熔断与半开恢复 / 同标识首失败结果一致
 ```
 
 核心接口：
@@ -43,15 +43,23 @@ uv run pytest          # 32 个用例：分级配额 / 并发配额 / 重复与�
 - 调用方通过 `Idempotency-Key` 请求头提交幂等键（不传则每次请求正常执行）。
 - 请求体的 `item`+`quantity` 经规范化哈希得到 **fingerprint**，规则如下：
   1. **首次提交**：登记 fingerprint，执行业务，结果（状态码 + 响应体）只写一次；
-  2. **同 key 同内容重复提交**：首次已完成则返回**完全一致**的状态码与响应体，
-     不再产生副作用；首次**仍在处理中**则等待其完成：
-     - 首个成功 → 复用同一成功结果；
-     - 首个失败 → 收到**与首个请求完全相同的失败**（reason / message / retry_after 一致），
-       不会被当成新请求再执行一次；
-  3. **同 key 内容不一致**：明确返回 `409 reason="idempotency_conflict"`，
+  2. **同 key 同内容并发提交（首个仍在处理中）**：后到的请求等待首个完成，
+     **不会被当成新请求再触发一次下游调用**，结果约定如下：
+     - 首个成功 → 所有并发提交复用**同一份**成功结果（状态码与响应体完全一致）；
+     - 首个失败（无论哪种失败）→ 所有并发提交收到**同一份**失败
+       （reason / message / retry_after 完全一致），对外只有一个确定、可解释的结果。
+     已认识的失败原因各自保持可区分：`rate_limit_exceeded` /
+     `global_capacity_exceeded` / `circuit_breaker_open` / `downstream_timeout` /
+     `downstream_error`；首个请求若因**非预期异常**失败，所有并发提交统一收到
+     `500 {"reason":"internal_error","message":"internal server error"}`，
+     内部异常的**类型、原始消息、堆栈一律不透出**（只记服务端日志）；
+  3. **首个已完成后的同 key 同内容重复提交**：直接返回**完全一致**的状态码与
+     响应体，不再产生副作用；
+  4. **同 key 内容不一致**：明确返回 `409 reason="idempotency_conflict"`，
      **不覆盖**先前结果；随后用原始内容重放仍能拿到首次结果；
-  4. 首次请求失败后占位被移除（**失败结果不缓存**），之后携带同一 key 的新请求
-     可作为新一轮首次请求正常执行；无论成功失败，**真实副作用全程只发生一次**。
+  5. 首次请求失败（含非预期异常）后占位被移除（**失败结果不缓存、标识不被一直
+     占用**），之后携带同一 key 的重试作为新一轮首次请求正常执行；无论成功失败，
+     **真实下单全程只发生一次**。
 - 结果在 `idempotency_ttl_seconds` 内有效，TTL 到期后同 key 可开启新一轮请求。
 - 实现为进程内带锁存储，适用于单实例语义；多实例部署需替换为 Redis 等共享存储。
 
@@ -130,20 +138,40 @@ app/
   downstream.py      本地模拟下游（ok/fail/timeout/flaky）
   service.py         编排：限流 → 幂等 → 全局容量 → 熔断 → 带超时下游调用
   api.py             FastAPI 路由与统一错误处理
-tests/               限流(6) + 分级配额(5) + 幂等(5) + 全局容量(4) + 并发隔离(4) + 熔断(6) + 错误契约(2)
+tests/               限流(6) + 分级配额(5) + 幂等(5) + 全局容量(4) + 并发隔离(6) + 熔断(6) + 错误契约(2)
 ```
 
 ## 八、本地验证新场景
 
 ```bash
-# 全部用例（含原有 19 个回归）
+# 全部用例（含原有 32 个回归），开头按业务模块列出用例、结尾按模块汇总通过情况
 uv run pytest
 
-# 只看新增场景
+# 只看新增场景（-s 可同时看到每个请求的输入与判定依据日志）
 uv run pytest tests/test_tiered_quota.py -s      # 分级配额：放宽/收紧/默认档/状态接口
 uv run pytest tests/test_global_capacity.py -s   # 全局容量拒绝、公平性、状态视图
-uv run pytest tests/test_concurrency.py -s       # 慢请求并行、并发同标识首个失败
+uv run pytest tests/test_concurrency.py -s       # 慢请求并行；并发同标识首个失败
 ```
+
+`tests/test_concurrency.py` 中与并发同标识相关的 4 条用例，可按首个请求结果
+分两类单独验证：
+
+```bash
+# 场景 A：并发同标识、首个成功 -> 所有提交同一份成功结果，真实下单只发生一次
+uv run pytest -s tests/test_concurrency.py::test_in_flight_duplicate_does_not_double_execute
+
+# 场景 B：并发同标识、首个失败 -> 等待者拿到与首个完全相同的失败，且不重复下单
+#   B1: 失败属于"已认识"的下游报错（502 downstream_error）
+uv run pytest -s tests/test_concurrency.py::test_concurrent_same_key_first_fails_deterministic_outcome
+uv run pytest -s tests/test_concurrency.py::test_concurrent_same_key_first_fails_never_double_orders
+#   B2: 下游抛出非预期异常（两份响应一致为 500 internal_error，无内部细节泄露；
+#       失败后同标识重试成功且全程只下一次单）
+uv run pytest -s tests/test_concurrency.py::test_concurrent_same_key_unexpected_error_unified_outcome
+uv run pytest -s tests/test_concurrency.py::test_concurrent_same_key_unexpected_error_never_double_orders
+```
+
+> 注意：场景 A 用例在 `tests/test_idempotency.py`；B2 正是本次修复的链路——
+> 修复前等待中的重复请求会拿到 `400 guardrail_error` 且响应体直接携带内部异常原文。
 
 手动验证（服务运行在 `localhost:8000`）：
 
@@ -154,13 +182,30 @@ curl -i -X POST localhost:8000/orders -H 'X-Caller-Id: vip' \
 curl -s localhost:8000/health/downstream -H 'X-Caller-Id: vip'
 # -> caller_quota_tier / caller_quota_limit / caller_used_quota / caller_quota_remaining
 
-# 并发同标识重复提交（应返回完全一致的结果，且只下一次单）
+# 并发同标识重复提交（首个成功：应返回完全一致的结果，且只下一次单）
 curl -s -X POST localhost:8000/orders -H 'X-Caller-Id: a' -H 'Idempotency-Key: k1' \
      -H 'Content-Type: application/json' -d '{"item":"book","quantity":1}' &
 curl -s -X POST localhost:8000/orders -H 'X-Caller-Id: a' -H 'Idempotency-Key: k1' \
      -H 'Content-Type: application/json' -d '{"item":"book","quantity":1}' &
 wait
+
+# 并发同标识、首个失败：先切到下游报错模式再并发提交，
+# 两个响应应为完全一致的 502 downstream_error（失败原因可区分、结果确定）
+curl -s -X POST localhost:8000/test/downstream-mode/fail
+curl -s -X POST localhost:8000/orders -H 'X-Caller-Id: b' -H 'Idempotency-Key: k2' \
+     -H 'Content-Type: application/json' -d '{"item":"book","quantity":1}' &
+curl -s -X POST localhost:8000/orders -H 'X-Caller-Id: b' -H 'Idempotency-Key: k2' \
+     -H 'Content-Type: application/json' -d '{"item":"book","quantity":1}' &
+wait
+# 恢复 ok 后用同一标识重试：应 201 成功（失败不缓存，重试是新一轮首次请求）
+curl -s -X POST localhost:8000/test/downstream-mode/ok
+curl -i -X POST localhost:8000/orders -H 'X-Caller-Id: b' -H 'Idempotency-Key: k2' \
+     -H 'Content-Type: application/json' -d '{"item":"book","quantity":1}'
 ```
+
+> 非预期异常（下游抛出 `RuntimeError`/`TimeoutError` 以外的异常）无法通过
+> `/test/downstream-mode` 手动注入，其并发一致性由
+> `test_concurrent_same_key_unexpected_error_*` 两条用例稳定复现并守护。
 
 单测执行时会以 INFO 级别打印**请求输入与判定依据**（窗口已用额度与命中档位、ALLOW/REJECT、
 fingerprint 匹配/冲突、容量在途与份额、状态迁移与探测计数），可通过 `uv run pytest -s` 查看。

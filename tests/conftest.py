@@ -135,3 +135,63 @@ def pytest_configure(config):
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     root.propagate = False
+
+
+# 业务模块 -> 中文说明：汇总时按业务分组展示用例与通过情况
+_BUSINESS_LABELS = {
+    "test_rate_limit": "调用方限流",
+    "test_tiered_quota": "分级配额",
+    "test_idempotency": "幂等提交",
+    "test_global_capacity": "整体容量保护",
+    "test_concurrency": "并发隔离与同标识结果一致",
+    "test_circuit_breaker": "熔断与半开恢复",
+    "test_error_contract": "错误契约与内部错误不外泄",
+}
+
+
+def pytest_report_collectionfinish(config, start_path, items):
+    # 收集完成后按业务模块列出覆盖的用例（先换行，避免与进度点挤在同一行）
+    from collections import defaultdict
+
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for item in items:
+        module = item.nodeid.split("::", 1)[0].rsplit("/", 1)[-1].replace(".py", "")
+        grouped[module].append(item.name)
+    lines = ["", "按业务模块覆盖的用例："]
+    for module, names in grouped.items():
+        label = _BUSINESS_LABELS.get(module, module)
+        lines.append(f"  [{label}] {module}.py ({len(names)} 条)")
+        for name in names:
+            lines.append(f"      - {name}")
+    return "\n".join(lines)
+
+
+def pytest_runtest_logreport(report):
+    # 每条用例调用阶段实时打印通过情况；guardrails logger 自带直写 stderr 的
+    # handler 且 propagate=False，不受 pytest 日志捕获影响，不加 -s 也能看到。
+    # 用 nodeid 取模块名（收集路径稳定，不受 tests/__init__.py 包解析影响）。
+    if report.when != "call":
+        return
+    module = report.nodeid.split("::", 1)[0].rsplit("/", 1)[-1].replace(".py", "")
+    mark = "PASS" if report.passed else "FAIL"
+    logging.getLogger("guardrails.test").info("[%s] %s::%s", mark, module, report.head_line)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    # 结束时按业务模块汇总通过/失败数，整体回归情况一目了然
+    from collections import defaultdict
+
+    stats: dict[str, dict[str, int]] = defaultdict(lambda: {"passed": 0, "failed": 0, "skipped": 0})
+    for key in ("passed", "failed", "skipped"):
+        for report in terminalreporter.stats.get(key, []):
+            if report.when != "call":
+                continue
+            module = report.nodeid.split("::", 1)[0].rsplit("/", 1)[-1].replace(".py", "")
+            stats[module][key] += 1
+
+    terminalreporter.write_sep("=", "按业务模块汇总")
+    for module, counts in sorted(stats.items()):
+        label = _BUSINESS_LABELS.get(module, module)
+        terminalreporter.write_line(
+            f"  [{label}] {module}: 通过 {counts['passed']} / 失败 {counts['failed']} / 跳过 {counts['skipped']}"
+        )
