@@ -48,3 +48,17 @@ class DownstreamTimeout(GuardrailError):
 class DownstreamError(GuardrailError):
     reason = "downstream_error"
     status_code = 502
+
+
+class InternalError(GuardrailError):
+    """非预期内部异常的脱敏形式：固定文案，类型/消息/堆栈一律不外泄。
+
+    响应体与 API 层兜底 Exception 处理器完全一致（500 internal_error），
+    因此无论是否经过幂等层，对外契约保持不变。
+    """
+
+    reason = "internal_error"
+    status_code = 500
+
+    def __init__(self) -> None:
+        super().__init__("internal server error")

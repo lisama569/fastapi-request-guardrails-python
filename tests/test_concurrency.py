@@ -158,6 +158,70 @@ def test_concurrent_same_key_first_fails_deterministic_outcome(build, monkeypatc
     print(f"[输入] 失败后同key重试再重放 [依据] 重试201且副作用={svc.side_effect_count}, 重放结果一致")
 
 
+def test_concurrent_same_key_first_fails_unexpected_exception(build, monkeypatch):
+    """并发同标识、首个因下游非预期异常失败：两个请求拿到同一份脱敏失败，内部细节不外泄。"""
+    client, svc, components = build(rate_limit=100)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def boom(payload):
+        with lock:
+            calls["n"] += 1
+        entered.set()
+        release.wait(timeout=5.0)
+        raise ValueError("secret-internal-detail-xyz db connection string leaked")
+
+    monkeypatch.setattr(svc.downstream, "call", boom)
+
+    headers = {"X-Caller-Id": "idem-unexpected", "Idempotency-Key": "key-unexpected-1"}
+    results: dict[int, object] = {}
+
+    def post(idx):
+        c = _fresh_client(svc)
+        with c:
+            results[idx] = c.post("/orders", json={"item": "pen", "quantity": 1}, headers=headers)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(post, 1)
+        entered.wait(timeout=2.0)
+        time.sleep(0.05)  # 确保首个请求已登记 key 且在处理中
+        f2 = pool.submit(post, 2)
+        time.sleep(0.2)
+        release.set()
+        f1.result()
+        f2.result()
+
+    r1, r2 = results[1], results[2]
+    # 同一标识的并发提交：对外只有一个确定结果（两个响应完全一致）
+    assert r1.status_code == r2.status_code == 500
+    assert r1.json() == r2.json()
+    body = r1.json()["error"]
+    assert body["reason"] == "internal_error"
+    assert body["message"] == "internal server error"
+    # 内部异常的类型 / 消息 / 堆栈一律不透出
+    for leaked in ("secret-internal-detail-xyz", "ValueError", "Traceback", "db connection"):
+        assert leaked not in str(r1.json()) and leaked not in str(r2.json())
+    assert calls["n"] == 1, "并发同标识只能有一个请求真正打到下游"
+    assert svc.side_effect_count == 0, "失败的请求不产生副作用"
+    print(f"[输入] 同key并发且首个遇非预期异常 key=key-unexpected-1 "
+          f"[依据] 两个响应一致 -> {body['reason']}, 下游调用={calls['n']}, 副作用={svc.side_effect_count}")
+
+    # 失败不缓存：同一标识重试可正常成功，真实下单全程只发生一次
+    monkeypatch.undo()
+    r3 = client.post("/orders", json={"item": "pen", "quantity": 1}, headers=headers)
+    assert r3.status_code == 201
+    assert svc.side_effect_count == 1
+
+    # 成功结果被缓存：再重放返回同一结果，不再产生副作用
+    r4 = client.post("/orders", json={"item": "pen", "quantity": 1}, headers=headers)
+    assert r4.status_code == 201
+    assert r4.json() == r3.json()
+    assert svc.side_effect_count == 1
+    print(f"[输入] 非预期失败后同key重试再重放 [依据] 重试201且副作用={svc.side_effect_count}, 重放结果一致")
+
+
 def test_concurrent_same_key_first_fails_never_double_orders(build, monkeypatch):
     """首个失败时，并发到达的重复提交不会被当成新请求再下一次单。"""
     client, svc, components = build(rate_limit=100)

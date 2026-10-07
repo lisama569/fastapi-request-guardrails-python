@@ -15,7 +15,13 @@ from .capacity import GlobalCapacityGuard
 from .circuit_breaker import CircuitBreaker
 from .config import Settings, get_settings
 from .downstream import DownstreamClient
-from .errors import CircuitBreakerOpen, DownstreamError, DownstreamTimeout, GuardrailError
+from .errors import (
+    CircuitBreakerOpen,
+    DownstreamError,
+    DownstreamTimeout,
+    GuardrailError,
+    InternalError,
+)
 from .idempotency import IdempotencyStore, KeyState
 from .rate_limiter import RateLimiter
 
@@ -83,9 +89,14 @@ class OrderService:
                 self.idempotency.fail(state, exc)
             raise
         except Exception as exc:
+            # 非预期异常：与可预期失败走同一条统一失败处理。
+            # 原始异常只进服务端日志（含堆栈）；对外与等待中的重复请求都拿到
+            # 同一个脱敏后的 InternalError，类型/消息/堆栈一律不外泄。
+            logger.exception("unexpected internal error during create_order: %r", exc)
+            internal = InternalError()
             if state is not None:
-                self.idempotency.fail(state, GuardrailError(str(exc) or "internal error"))
-            raise
+                self.idempotency.fail(state, internal)
+            raise internal from None
 
         if state is not None:
             self.idempotency.complete(state, status, body)
